@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# Triton compiled-cache artifacts
+.triton/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / profiles
+*.log
+*.nsys-rep
+wandb/

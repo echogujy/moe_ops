@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triton-gmm-ops"
+version = "0.1.0"
+description = "Pure-Triton MoE operators: grouped GEMM, permute/unpermute, and fused kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "triton",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["triton_gmm_ops*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
