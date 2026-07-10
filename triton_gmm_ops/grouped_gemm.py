@@ -12,9 +12,20 @@ def num_sms():
 _TL_DTYPE = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64,  'BLOCK_SIZE_K': 32}, num_warps=4, num_stages=3),
+    ],
+    key=['N', 'K'],
+)
 @triton.jit
-def gmm_try_kernel(
-    a_ptr, b_ptr, c_ptr, offsets, group_size,
+def gmm_forward_kernel(
+    a_ptr, b_ptr, c_ptr, offsets,
     N: tl.constexpr, K: tl.constexpr,
     lda: tl.constexpr, ldc: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
@@ -25,12 +36,8 @@ def gmm_try_kernel(
     g = tl.program_id(2).to(tl.int64)
     
     # start row of expert g in A and C
-    if g == 0:
-        start_g = tl.cast(0, tl.int64)
-    else:
-        start_g = tl.load(offsets + (g - 1)).to(tl.int64)
-        
-    end_g = tl.load(offsets + g).to(tl.int64)
+    start_g = tl.load(offsets + g).to(tl.int64)
+    end_g = tl.load(offsets + g + 1).to(tl.int64)
     M_g = end_g - start_g
     
     if tile_m_idx * BLOCK_SIZE_M >= M_g:
@@ -62,7 +69,7 @@ def gmm_try_kernel(
             b_mask = b_mask_n & (g_k[:, None] < K)
             b = tl.load(b_base + g_k[:, None] * N + offs_bn[None, :], mask=b_mask, other=0.0)
             
-        accumulator += tl.dot(a, b)
+        accumulator = tl.dot(a, b, acc=accumulator)
         
     c = accumulator.to(BLOCK_DTYPE)
     c_ptrs = c_base + offs_am[:, None] * ldc + offs_bn[None, :]
@@ -75,19 +82,18 @@ def gmm_try_fn(A, B, offsets, trans_b: bool = True):
     total, K = A.shape
     E = B.shape[0]
     N = B.shape[1] if trans_b else B.shape[2]
-    
-    # Use fallback block size if not autotuning or for initialization
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 64
-    
+    # Size the M-grid by the largest expert, not by `total`. The old grid used
+    # `total` -> ~E x empty tiles early-returning (pure launch waste).
+    M_max = int((offsets[1:] - offsets[:-1]).max().item())
     C = torch.empty((total, N), device=A.device, dtype=dtype)
-    grid = (triton.cdiv(total, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N), E)
-    
-    gmm_try_kernel[grid](
-        A, B, C, offsets, E, N, K,
+    grid = lambda META: (
+        triton.cdiv(M_max, META['BLOCK_SIZE_M']),
+        triton.cdiv(N, META['BLOCK_SIZE_N']),
+        E,
+    )
+    gmm_forward_kernel[grid](
+        A, B, C, offsets, N, K,
         A.stride(0), C.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
         TRANS_B=trans_b, BLOCK_DTYPE=_TL_DTYPE[dtype]
     )
     return C
@@ -95,89 +101,75 @@ def gmm_try_fn(A, B, offsets, trans_b: bool = True):
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_M': 32}),
-        triton.Config({'BLOCK_SIZE_K': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 32}),
-        triton.Config({'BLOCK_SIZE_K': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_M': 32}),
-        triton.Config({'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_M': 32}),
+        # small contraction (M_e ~512): big N/K tiles, small M tile, deep pipeline
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 256}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 256}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 64,  'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_warps=4, num_stages=5),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_warps=8, num_stages=3),
     ],
-    key=['group_size'],
+    key=['N', 'K'],
 )
 @triton.jit
-def gmm_try_gradB_kernel(
-    a_ptr, g_ptr, c_ptr, offsets, group_size,
+def gmm_gradB_kernel(
+    g_ptr, a_ptr, c_ptr, offsets,
     K: tl.constexpr, N: tl.constexpr,
-    lda: tl.constexpr, ldg: tl.constexpr,
-    ldc: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
-    TRANS_B: tl.constexpr, BLOCK_DTYPE: tl.constexpr,
+    ldg: tl.constexpr, lda: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_DTYPE: tl.constexpr,
 ):
-    g = tl.program_id(0).to(tl.int64)
-    tile = tl.program_id(1)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    
-    GROUP_K = 8
-    tiles_per_group = GROUP_K * num_n_tiles
-    group_idx = tile // tiles_per_group
-    first_tile_k = group_idx * GROUP_K
-    current_group_size_k = tl.minimum(num_k_tiles - first_tile_k, GROUP_K)
-    idx_in_group = tile % tiles_per_group
-    tile_k = first_tile_k + (idx_in_group % current_group_size_k)
-    tile_n = idx_in_group // current_group_size_k
-    
-    idx = tl.maximum(g - 1, 0)
-    prev = tl.load(offsets + idx).to(tl.int64)
-    start_g = tl.where(g == 0, tl.cast(0, tl.int64), prev)
-    end_g = tl.load(offsets + g).to(tl.int64)
+    # grad_B[g] = G_g^T @ A_g  ->  [N, K] = [N, M_e] @ [M_e, K], contraction over M_e (small).
+    # Tile the large output (N, K); loop the small contraction M_e. Big N/K tiles +
+    # deep num_stages is what small-contraction GEMMs need to keep tensor cores busy.
+    tile_r = tl.program_id(0).to(tl.int64)   # N (output rows)
+    tile_c = tl.program_id(1).to(tl.int64)   # K (output cols)
+    g = tl.program_id(2).to(tl.int64)
+    start_g = tl.load(offsets + g).to(tl.int64)
+    end_g = tl.load(offsets + g + 1).to(tl.int64)
     M_e = end_g - start_g
-    
-    a_base = a_ptr + start_g * lda
+
+    offs_r = tile_r * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)   # N indices
+    offs_c = tile_c * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)   # K indices
+    offs_m = tl.arange(0, BLOCK_SIZE_M)                          # token indices
+
     g_base = g_ptr + start_g * ldg
-    c_base = c_ptr + g * ldc
-    
-    offs_k = tile_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-    offs_n = tile_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_m = tl.arange(0, BLOCK_SIZE_M)
-    k_mask = offs_k[:, None] < K
-    n_mask = offs_n[None, :] < N
-    
-    acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
-    for m in range(0, tl.cdiv(M_e, BLOCK_SIZE_M)):
-        m_idx = m * BLOCK_SIZE_M + offs_m
-        m_b = m_idx[:, None] < M_e
-        a_coalesced = tl.load(a_base + m_idx[:, None] * lda + offs_k[None, :],
-                              mask=(m_idx[:, None] < M_e) & (offs_k[None, :] < K),
-                              other=0.0)
-        a = tl.trans(a_coalesced)
-        gg = tl.load(g_base + m_idx[:, None] * ldg + offs_n[None, :], mask=m_b & n_mask, other=0.0)
-        acc += tl.dot(a, gg)
-        
-    c = acc.to(BLOCK_DTYPE)
-    if TRANS_B:
-        c_ptrs = c_base + offs_n[None, :] * K + offs_k[:, None]
-        tl.store(c_ptrs, c, mask=k_mask & n_mask)
-    else:
-        c_ptrs = c_base + offs_k[:, None] * N + offs_n[None, :]
-        tl.store(c_ptrs, c, mask=k_mask & n_mask)
+    a_base = a_ptr + start_g * lda
+    c_base = c_ptr + g * N * K
+
+    accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
+    for mm in range(0, tl.cdiv(M_e, BLOCK_SIZE_M)):
+        m_idx = mm * BLOCK_SIZE_M + offs_m
+        # gg[m, n] = G_g[m, n]  ->  [M_tile, N_tile]
+        gg = tl.load(g_base + m_idx[:, None] * ldg + offs_r[None, :],
+                     mask=(m_idx[:, None] < M_e) & (offs_r[None, :] < N), other=0.0)
+        # aa[m, k] = A_g[m, k]  ->  [M_tile, K_tile]
+        aa = tl.load(a_base + m_idx[:, None] * lda + offs_c[None, :],
+                     mask=(m_idx[:, None] < M_e) & (offs_c[None, :] < K), other=0.0)
+        # grad_B[n, k] = sum_m gg[m,n] * aa[m,k] = tl.trans(gg) @ aa
+        accumulator = tl.dot(tl.trans(gg), aa, acc=accumulator)
+
+    c = accumulator.to(BLOCK_DTYPE)
+    c_ptrs = c_base + offs_r[:, None] * K + offs_c[None, :]
+    tl.store(c_ptrs, c, mask=(offs_r[:, None] < N) & (offs_c[None, :] < K))
 
 
-def gmm_try_gradB(A, B, offsets, grad_output, trans_b):
+def gmm_try_gradB(A, B, offsets, grad_output, trans_b=True):
     E = B.shape[0]
     K = A.shape[1]
     N = B.shape[1] if trans_b else B.shape[2]
-    if trans_b:
-        base = torch.empty(E, N, K, device=A.device, dtype=A.dtype)
-    else:
-        base = torch.empty(E, K, N, device=A.device, dtype=A.dtype)
-        
+    assert trans_b, "grad_B only supports trans_b=True"
+    base = torch.empty(E, N, K, device=A.device, dtype=A.dtype)
     grid = lambda META: (
+        triton.cdiv(N, META['BLOCK_SIZE_N']),
+        triton.cdiv(K, META['BLOCK_SIZE_K']),
         E,
-        triton.cdiv(N, META['BLOCK_SIZE_N']) * triton.cdiv(K, META['BLOCK_SIZE_K']),
     )
-    gmm_try_gradB_kernel[grid](
-        A, grad_output, base, offsets, E,
-        K, N, A.stride(0), grad_output.stride(0), base.stride(0),
-        TRANS_B=trans_b, BLOCK_DTYPE=_TL_DTYPE[A.dtype]
+    gmm_gradB_kernel[grid](
+        grad_output, A, base, offsets,
+        K, N, grad_output.stride(0), A.stride(0),
+        BLOCK_DTYPE=_TL_DTYPE[A.dtype]
     )
     return base
 

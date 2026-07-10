@@ -20,15 +20,15 @@ def _bench(fn, warmup=10, iters=100):
     return (time.time() - start) * 1000 / iters
 
 
-def run_correctness():
+def run_correctness(dtype=torch.bfloat16, atol=3.0, rtol=0.02):
     # Shapes
     num_tokens = 8192
     K = 4096
     E = 16
     N = 4096
     
-    A = torch.randn(num_tokens, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
-    B = torch.randn(E, N, K, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    A = torch.randn(num_tokens, K, device=DEVICE, dtype=dtype, requires_grad=True)
+    B = torch.randn(E, N, K, device=DEVICE, dtype=dtype, requires_grad=True)
     w_native = B.transpose(1, 2).contiguous().detach().requires_grad_(True)
     
     indices = torch.randint(0, E, (num_tokens,), device=DEVICE, dtype=torch.int32)
@@ -36,9 +36,11 @@ def run_correctness():
     for idx in indices:
         sizes[idx] += 1
     offsets = torch.cumsum(sizes, dim=0).to(torch.int32)
+    offsets_tri = torch.zeros(E + 1, dtype=torch.int32, device=DEVICE)
+    offsets_tri[1:] = offsets
     
     # Triton
-    C_tri = grouped_gemm(A, B, offsets, trans_b=True)
+    C_tri = grouped_gemm(A, B, offsets_tri, trans_b=True)
     grad_output = torch.randn_like(C_tri)
     C_tri.backward(grad_output, retain_graph=True)
     grad_A_tri = A.grad.clone()
@@ -54,18 +56,27 @@ def run_correctness():
     grad_A_nat = A_n.grad.clone()
     grad_B_nat = w_native_n.grad.transpose(1, 2).clone()
     
-    max_diff_fwd = torch.max(torch.abs(C_tri - C_native)).item()
-    max_diff_grad_a = torch.max(torch.abs(grad_A_tri - grad_A_nat)).item()
-    max_diff_grad_b = torch.max(torch.abs(grad_B_tri - grad_B_nat)).item()
-    
-    print("================================================================")
-    print("Correctness Check - Triton vs Torch Native:")
-    print("================================================================")
-    print(f"  Forward Diff:   {max_diff_fwd:.2e} -> {'PASS' if max_diff_fwd < 5.0 else 'FAIL'}")
-    print(f"  Grad_A Diff:    {max_diff_grad_a:.2e} -> {'PASS' if max_diff_grad_a < 5.0 else 'FAIL'}")
-    print(f"  Grad_B Diff:    {max_diff_grad_b:.2e} -> {'PASS' if max_diff_grad_b < 5.0 else 'FAIL'}")
-    print("================================================================")
+    # bf16 K=4096 GEMM: abs error <= ~2.0 (BF16 accumulation), rel ~0.5%.
+    # Use allclose-style: |a-b| <= atol + rtol * |b|.
+    ATOL, RTOL = atol, rtol
+    ok_fwd   = torch.allclose(C_tri.float(),      C_native.float(), atol=ATOL, rtol=RTOL)
+    ok_ga    = torch.allclose(grad_A_tri.float(),  grad_A_nat.float(), atol=ATOL, rtol=RTOL)
+    ok_gb    = torch.allclose(grad_B_tri.float(),  grad_B_nat.float(), atol=ATOL, rtol=RTOL)
+    abs_fwd  = (C_tri.float() - C_native.float()).abs().max().item()
+    abs_ga   = (grad_A_tri.float() - grad_A_nat.float()).abs().max().item()
+    abs_gb   = (grad_B_tri.float() - grad_B_nat.float()).abs().max().item()
 
+    print("================================================================")
+    print(f"Correctness Check - Triton vs Torch Native ({dtype}, K={K}):")
+    print("================================================================")
+    print(f"  Forward  abs_max: {abs_fwd:.3f}  -> {'PASS' if ok_fwd else 'FAIL'}")
+    print(f"  Grad_A   abs_max: {abs_ga:.3f}  -> {'PASS' if ok_ga else 'FAIL'}")
+    print(f"  Grad_B   abs_max: {abs_gb:.3f}  -> {'PASS' if ok_gb else 'FAIL'}")
+    print(f"  (atol={ATOL}, rtol={RTOL})")
+    print("================================================================")
+    assert ok_fwd, f"[{dtype}] grouped_gemm forward abs diff too large: {abs_fwd:.3f}"
+    assert ok_ga,  f"[{dtype}] grouped_gemm grad_A abs diff too large: {abs_ga:.3f}"
+    assert ok_gb,  f"[{dtype}] grouped_gemm grad_B abs diff too large: {abs_gb:.3f}"
 
 def run_benchmark():
     shapes = [
@@ -91,8 +102,10 @@ def run_benchmark():
         for idx in indices:
             sizes[idx] += 1
         offsets = torch.cumsum(sizes, dim=0).to(torch.int32)
+        offsets_tri = torch.zeros(E + 1, dtype=torch.int32, device=DEVICE)
+        offsets_tri[1:] = offsets
         
-        t_tri = _bench(lambda: grouped_gemm(A, B, offsets, trans_b=True))
+        t_tri = _bench(lambda: grouped_gemm(A, B, offsets_tri, trans_b=True))
         t_nat = _bench(lambda: torch.nn.functional.grouped_mm(A, w_native, offs=offsets))
         
         shape_str = f"{tokens}x{K}x{E}x{N}"
@@ -118,8 +131,10 @@ def run_benchmark():
         for idx in indices:
             sizes[idx] += 1
         offsets = torch.cumsum(sizes, dim=0).to(torch.int32)
+        offsets_tri = torch.zeros(E + 1, dtype=torch.int32, device=DEVICE)
+        offsets_tri[1:] = offsets
         
-        C_tri = grouped_gemm(A, B, offsets, trans_b=True)
+        C_tri = grouped_gemm(A, B, offsets_tri, trans_b=True)
         grad_out = torch.randn_like(C_tri)
         
         # backward triton bench
@@ -147,5 +162,6 @@ def run_benchmark():
 
 
 if __name__ == "__main__":
-    run_correctness()
+    run_correctness(torch.bfloat16, atol=3.0, rtol=0.02)
+    run_correctness(torch.float32,   atol=0.5, rtol=0.01)
     run_benchmark()

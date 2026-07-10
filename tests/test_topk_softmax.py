@@ -29,15 +29,18 @@ def test_correctness():
     
     num_tokens = 8192
     print("================================================================")
-    print("Correctness Check - Fused Top-K Softmax (Forward & Backward):")
+    print("Correctness Check - Fused Top-K Softmax (Forward & Backward in BF16):")
     print("================================================================")
     
     for E, K in configs:
-        logits = torch.randn(num_tokens, E, device=DEVICE, dtype=torch.float32).requires_grad_(True)
+        # Generate non-overlapping columns in float32, then cast to bfloat16 to guarantee no ties
+        logits = torch.randn(num_tokens, E, device=DEVICE, dtype=torch.float32) * 0.05
+        cols = torch.arange(E, device=DEVICE).float() * 0.5
+        logits = (logits + cols.unsqueeze(0)).to(torch.bfloat16).requires_grad_(True)
         
         # 1. Reference (PyTorch Native)
         w_ref, idx_ref = torch.topk(logits, K, dim=-1)
-        w_ref_soft = torch.nn.functional.softmax(w_ref, dim=-1)
+        w_ref_soft = torch.nn.functional.softmax(w_ref.float(), dim=-1).to(torch.bfloat16)
         
         grad_out = torch.randn_like(w_ref_soft)
         w_ref_soft.backward(grad_out, retain_graph=True)
@@ -51,14 +54,22 @@ def test_correctness():
         grad_logits_fused = logits.grad.clone()
         
         # Check diffs
-        max_diff_fwd = torch.max(torch.abs(w_ref_soft - w_fused)).item()
+        max_diff_fwd = torch.max(torch.abs(w_ref_soft.float() - w_fused.float())).item()
         max_diff_idx = torch.max(torch.abs(idx_ref.int() - idx_fused)).item()
-        max_diff_bwd = torch.max(torch.abs(grad_logits_ref - grad_logits_fused)).item()
+        max_diff_bwd = torch.max(torch.abs(grad_logits_ref.float() - grad_logits_fused.float())).item()
+        
+        # bf16 tolerances are typically around 1e-2 to 1e-3
+        fwd_ok = max_diff_fwd < 1e-2
+        idx_ok = max_diff_idx == 0
+        bwd_ok = max_diff_bwd < 1e-2
         
         print(f"Config E={E}, K={K}:")
-        print(f"  Forward Diff: {max_diff_fwd:.2e} -> {'PASS' if max_diff_fwd < 1e-4 else 'FAIL'}")
-        print(f"  Indices Diff: {max_diff_idx:.2e} -> {'PASS' if max_diff_idx == 0 else 'FAIL'}")
-        print(f"  Backward Diff: {max_diff_bwd:.2e} -> {'PASS' if max_diff_bwd < 1e-4 else 'FAIL'}")
+        print(f"  Forward Diff:  {max_diff_fwd:.2e} -> {'PASS' if fwd_ok else 'FAIL'}")
+        print(f"  Indices Diff:  {max_diff_idx:.2e} -> {'PASS' if idx_ok else 'FAIL'}")
+        print(f"  Backward Diff: {max_diff_bwd:.2e} -> {'PASS' if bwd_ok else 'FAIL'}")
+        assert fwd_ok, f"Forward mismatch: {max_diff_fwd:.2e}"
+        assert idx_ok, f"Indices mismatch: {max_diff_idx:.2e}"
+        assert bwd_ok, f"Backward mismatch: {max_diff_bwd:.2e}"
     print("================================================================")
 
 

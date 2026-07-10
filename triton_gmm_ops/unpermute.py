@@ -1,24 +1,4 @@
-"""Triton implementation of grouped_gemm's ``moe_recover_topK`` (unpermute).
 
-Recovers the original token order from the expert-grouped (permuted) layout
-produced by ``permute``. ``permute`` emits two tensors:
-  * ``input``      : permuted activations, row ``idx`` holds some token's vector.
-  * ``row_id_map`` : ``row_id_map[k*num_tokens + t] == idx`` — the permuted row
-                     that holds token ``t``'s ``k``-th expert slot. ``-1`` marks
-                     a dropped slot (capacity drop).
-
-Forward (replaces ``_C.unpermute``):
-  out[t] = Σ_k  prob[t, k] * input[row_id_map[k*num_tokens + t]]
-  (a dropped slot, row_id_map == -1, contributes nothing)
-
-Backward (replaces ``_C.unpermute_bwd``), one program per (token t, slot k):
-  act_grad[i]  = prob[t, k] * grad_out[t]          # scatter, unique i per (t,k)
-  prob_grad[t, k] = Σ_col grad_out[t, col] * input[i, col]   # dot over columns
-
-Note: ``prob`` may be float32 OR bfloat16 — the kernel upcasts the weight inside
-the float32 accumulator (``vals * p`` with ``vals`` already float32), so no dtype
-coercion is needed (unlike the C++ backend, whose prob_ptr is hard-typed float*).
-"""
 import torch
 import triton
 import triton.language as tl
