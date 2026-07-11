@@ -3,7 +3,9 @@ import torch
 import triton
 import triton.language as tl
 
-from .unpermute import unpermute_forward  # permute backward == unpermute(prob=1)
+_NS = "tg"
+
+from .unpermute_ops import unpermute_forward  # permute backward == unpermute(prob=1)
 
 
 # ----------------------------------------------------------------------------
@@ -72,14 +74,24 @@ def _permute_countsort_kernel(
         tl.store(row_id_map_ptr + (k * num_tokens + t), dest.to(tl.int32))
 
 
+# Two-layer pattern: the counting-sort (raw triton launches) is a custom_op so
+# Dynamo/Inductor see it as an opaque, shape-known node. E is a python int
+# (num_experts); callers under torch.compile always pass it, so the E<=0
+# fallback's .item() only runs eagerly.
+
+@torch.library.custom_op(f"{_NS}::permute_countsort", mutates_args=())
 def permute_countsort(input: torch.Tensor, indices: torch.Tensor,
-                      num_out_tokens: int = 0, E: int | None = None):
+                      num_out_tokens: int = 0, E: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens, num_cols = input.shape
     topK = indices.shape[1]
     flat = indices.reshape(-1).contiguous()
     num_total = num_tokens * topK
     num_out = num_out_tokens if num_out_tokens > 0 else num_total
-    if E is None:
+    # offsets (from the full histogram) always sum to num_total, so permuted
+    # must hold at least that many rows; a smaller capacity would make
+    # grouped_gemm read OOB. (Capacity-dropping isn't implemented here.)
+    num_out = max(num_out, num_total)
+    if E <= 0:
         E = int(flat.max()) + 1
 
     offsets = _group_offsets(flat, E)
@@ -98,6 +110,23 @@ def permute_countsort(input: torch.Tensor, indices: torch.Tensor,
     return permuted, row_id_map, offsets
 
 
+@permute_countsort.register_fake
+def _(input: torch.Tensor, indices: torch.Tensor,
+      num_out_tokens: int = 0, E: int = 0):
+    num_tokens, num_cols = input.shape
+    topK = indices.shape[1]
+    num_total = num_tokens * topK
+    num_out = max(num_out_tokens, num_total)
+    # offsets length is unused for shape derivation downstream, so a conservative
+    # bound keeps fake tracing valid when E isn't known at trace time.
+    off_len = E + 1 if E > 0 else num_total + 1
+    return (
+        torch.empty(num_out, num_cols, device=input.device, dtype=input.dtype),
+        torch.empty(num_total, device=input.device, dtype=torch.int32),
+        torch.empty(off_len, device=input.device, dtype=torch.int32),
+    )
+
+
 def permute_backward(grad_permuted: torch.Tensor, row_id_map: torch.Tensor,
                      num_tokens: int, topK: int) -> torch.Tensor:
     prob_ones = torch.ones(num_tokens, topK, device=grad_permuted.device, dtype=torch.float32)
@@ -109,7 +138,12 @@ class PermuteAutograd(torch.autograd.Function):
     def forward(ctx, input, indices, num_out_tokens=0, E=None):
         ctx.num_tokens = input.shape[0]
         ctx.topK = indices.shape[1] if indices.ndim > 1 else 1
-        permuted, row_id_map, offsets = permute_countsort(input, indices, num_out_tokens, E)
+        # E is forwarded to the custom_op; when None it becomes 0 and the real
+        # function resolves num_experts at runtime (its .item() is never traced,
+        # so no graph break under torch.compile). Compiled callers pass E.
+        e = E if E is not None else 0
+        permuted, row_id_map, offsets = torch.ops.tg.permute_countsort(
+            input, indices, num_out_tokens, e)
         ctx.save_for_backward(row_id_map)
         return permuted, row_id_map, offsets
 

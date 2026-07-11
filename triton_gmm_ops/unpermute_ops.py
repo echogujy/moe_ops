@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+_NS = "tg"
+
 
 @triton.autotune(
     configs=[
@@ -53,7 +55,9 @@ def _unpermute_kernel(
                  acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def unpermute_forward(input, row_id_map, prob, num_tokens, num_topK, max_tokens: int = -1):
+@torch.library.custom_op(f"{_NS}::unpermute_forward", mutates_args=())
+def unpermute_forward(input: torch.Tensor, row_id_map: torch.Tensor, prob: torch.Tensor,
+                      num_tokens: int, num_topK: int, max_tokens: int = -1) -> torch.Tensor:
     if max_tokens == -1:
         max_tokens = num_tokens
     num_cols = input.shape[1]
@@ -66,6 +70,13 @@ def unpermute_forward(input, row_id_map, prob, num_tokens, num_topK, max_tokens:
         out.stride(0), out.stride(1),
     )
     return out
+
+
+@unpermute_forward.register_fake
+def _(input, row_id_map, prob, num_tokens, num_topK, max_tokens=-1):
+    if max_tokens == -1:
+        max_tokens = num_tokens
+    return torch.empty(max_tokens, input.shape[1], device=input.device, dtype=input.dtype)
 
 
 @triton.autotune(
@@ -135,7 +146,10 @@ def _unpermute_bwd_kernel(
              acc.to(prob_grad_ptr.dtype.element_ty))
 
 
-def unpermute_backward(grad_out, input_fwd, row_id_map, prob, num_tokens, num_topK):
+@torch.library.custom_op(f"{_NS}::unpermute_backward", mutates_args=())
+def unpermute_backward(grad_out: torch.Tensor, input_fwd: torch.Tensor,
+                       row_id_map: torch.Tensor, prob: torch.Tensor,
+                       num_tokens: int, num_topK: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward: single merged kernel computing both act_grad and prob_grad."""
     num_cols = input_fwd.shape[1]
     act_grad = torch.empty_like(input_fwd)  # [num_out, num_cols]
@@ -152,6 +166,13 @@ def unpermute_backward(grad_out, input_fwd, row_id_map, prob, num_tokens, num_to
     return act_grad, prob_grad
 
 
+@unpermute_backward.register_fake
+def _(grad_out, input_fwd, row_id_map, prob, num_tokens, num_topK):
+    act_grad = torch.empty_like(input_fwd)
+    prob_grad = torch.empty(num_tokens, num_topK, device=prob.device, dtype=torch.float32)
+    return act_grad, prob_grad
+
+
 class UnpermuteAutograd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, row_id_map, prob, num_tokens, num_topK, max_tokens=-1):
@@ -161,12 +182,12 @@ class UnpermuteAutograd(torch.autograd.Function):
         ctx.num_tokens = num_tokens
         ctx.num_topK = num_topK
         ctx.max_tokens = max_tokens
-        return unpermute_forward(input, row_id_map, prob, num_tokens, num_topK, max_tokens)
+        return torch.ops.tg.unpermute_forward(input, row_id_map, prob, num_tokens, num_topK, max_tokens)
 
     @staticmethod
     def backward(ctx, grad_out):
         input, row_id_map, prob = ctx.saved_tensors
-        act_grad, prob_grad = unpermute_backward(
+        act_grad, prob_grad = torch.ops.tg.unpermute_backward(
             grad_out, input, row_id_map, prob, ctx.num_tokens, ctx.num_topK)
         return act_grad, None, prob_grad, None, None, None
 

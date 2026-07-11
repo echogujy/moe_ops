@@ -2,13 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
-
-def num_sms():
-    return torch.cuda.get_device_properties("cuda").multi_processor_count
-
-
 _TL_DTYPE = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 
 
@@ -76,7 +69,12 @@ def gmm_forward_kernel(
     tl.store(c_ptrs, c, mask=(offs_am[:, None] < M_g) & (offs_bn[None, :] < N))
 
 
-def gmm_try_fn(A, B, offsets, trans_b: bool = True):
+_NS = "tg"  # triton-gmm custom_op namespace
+
+
+@torch.library.custom_op(f"{_NS}::gmm_fwd_raw", mutates_args=())
+def gmm_try_fn(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor,
+                trans_b: bool = True) -> torch.Tensor:
     assert A.dtype == B.dtype
     dtype = A.dtype
     total, K = A.shape
@@ -88,6 +86,8 @@ def gmm_try_fn(A, B, offsets, trans_b: bool = True):
     # torch.compile -> graph break / compile crash. Oversizing the M-grid only
     # launches a few extra tiles that early-return per expert (see kernel guard),
     # so correctness is unchanged and the cost is negligible vs. a graph break.
+    # Wrapped as a custom_op, the triton launch + this grid run at
+    # inductor runtime (NOT traced), so no FakeTensor/.item() issue remains.
     grid = lambda META: (
         triton.cdiv(total, META['BLOCK_SIZE_M']),
         triton.cdiv(N, META['BLOCK_SIZE_N']),
@@ -99,6 +99,14 @@ def gmm_try_fn(A, B, offsets, trans_b: bool = True):
         TRANS_B=trans_b, BLOCK_DTYPE=_TL_DTYPE[dtype]
     )
     return C
+
+
+@gmm_try_fn.register_fake
+def _(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor,
+      trans_b: bool = True):
+    total, K = A.shape
+    N = B.shape[1] if trans_b else B.shape[2]
+    return torch.empty((total, N), device=A.device, dtype=A.dtype)
 
 
 @triton.autotune(
@@ -157,7 +165,15 @@ def gmm_gradB_kernel(
     tl.store(c_ptrs, c, mask=(offs_r[:, None] < N) & (offs_c[None, :] < K))
 
 
-def gmm_try_gradB(A, B, offsets, grad_output, trans_b=True):
+# Two-layer pattern (mirrors grouped_gemm_custom_op.py): the raw triton
+# launches are registered as custom_ops so Dynamo/Inductor see them as opaque,
+# shape-known nodes. This is what stops the control_deps KeyError when a
+# custom-op output (e.g. fused_topk_softmax's weights) feeds a functional
+# collective like fc.all_reduce inside a compiled graph.
+
+@torch.library.custom_op(f"{_NS}::gmm_bwd_B_raw", mutates_args=())
+def gmm_try_gradB(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor,
+                  grad_output: torch.Tensor, trans_b: bool = True) -> torch.Tensor:
     E = B.shape[0]
     K = A.shape[1]
     N = B.shape[1] if trans_b else B.shape[2]
@@ -176,12 +192,21 @@ def gmm_try_gradB(A, B, offsets, grad_output, trans_b=True):
     return base
 
 
+@gmm_try_gradB.register_fake
+def _(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor,
+      grad_output: torch.Tensor, trans_b: bool = True):
+    E = B.shape[0]
+    K = A.shape[1]
+    N = B.shape[1] if trans_b else B.shape[2]
+    return torch.empty(E, N, K, device=A.device, dtype=A.dtype)
+
+
 class GroupedGEMMAutograd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, B, offsets, trans_b=True):
         ctx.save_for_backward(A, B, offsets)
         ctx.trans_b = trans_b
-        return gmm_try_fn(A, B, offsets, trans_b=trans_b)
+        return torch.ops.tg.gmm_fwd_raw(A, B, offsets, trans_b=trans_b)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -190,9 +215,9 @@ class GroupedGEMMAutograd(torch.autograd.Function):
         grad_A = grad_B = None
         if ctx.needs_input_grad[0]:
             Wb = (B if trans_b else B.transpose(1, 2)).contiguous()
-            grad_A = gmm_try_fn(grad_output, Wb, offsets, trans_b=False)
+            grad_A = torch.ops.tg.gmm_fwd_raw(grad_output, Wb, offsets, trans_b=False)
         if ctx.needs_input_grad[1]:
-            grad_B = gmm_try_gradB(A, B, offsets, grad_output, trans_b)
+            grad_B = torch.ops.tg.gmm_bwd_B_raw(A, B, offsets, grad_output, trans_b)
         return grad_A, grad_B, None, None
 
 

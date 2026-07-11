@@ -5,8 +5,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import time
 import torch
-from triton_gmm_ops.permute import permute
-from triton_gmm_ops.unpermute import unpermute, unpermute_forward, unpermute_backward
+from triton_gmm_ops import permute
+from triton_gmm_ops import unpermute, unpermute_forward, unpermute_backward
 
 def _bench(fn, iters=50, warmup=10):
     for _ in range(warmup):

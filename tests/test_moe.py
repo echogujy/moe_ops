@@ -25,7 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import torch
 import torch.nn.functional as F
 
-from triton_gmm_ops import fused_topk_softmax, permute, grouped_gemm, unpermute
+from triton_gmm_ops import (
+    fused_topk_softmax,
+    permute,
+    grouped_gemm,
+    unpermute,
+)
 
 DEVICE = "cuda"
 

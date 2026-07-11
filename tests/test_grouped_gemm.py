@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 import time
-from triton_gmm_ops.grouped_gemm import grouped_gemm
+from triton_gmm_ops import grouped_gemm
 
 DEVICE = "cuda"
 

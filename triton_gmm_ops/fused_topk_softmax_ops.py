@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+_NS = "tg"
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 16}, num_warps=2),
@@ -111,47 +113,78 @@ def _fused_topk_softmax_bwd_kernel_2d(
     tl.store(store_ptrs, dy_out, mask=load_mask)
 
 
+# Two-layer pattern: raw triton launches wrapped as custom_ops so the
+# `weights`/`indices` outputs get proper FX provenance (no control_deps
+# KeyError when fed into a functional collective under torch.compile).
+
+@torch.library.custom_op(f"{_NS}::fused_topk_softmax_fwd", mutates_args=())
+def _fused_topk_softmax_fwd(logits: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, E = logits.shape
+    weights = torch.empty((num_tokens, K), device=logits.device, dtype=logits.dtype)
+    indices = torch.empty((num_tokens, K), device=logits.device, dtype=torch.int32)
+
+    BLOCK_E = triton.next_power_of_2(E)
+
+    # Grid is determined dynamically by the autotuned BLOCK_M config
+    grid = lambda META: (triton.cdiv(num_tokens, META['BLOCK_M']),)
+
+    _fused_topk_softmax_fwd_kernel_2d[grid](
+        logits, weights, indices,
+        num_tokens, E, K, BLOCK_E=BLOCK_E,
+    )
+
+    return weights, indices
+
+
+@_fused_topk_softmax_fwd.register_fake
+def _(logits: torch.Tensor, K: int):
+    num_tokens = logits.shape[0]
+    return (
+        torch.empty((num_tokens, K), device=logits.device, dtype=logits.dtype),
+        torch.empty((num_tokens, K), device=logits.device, dtype=torch.int32),
+    )
+
+
+@torch.library.custom_op(f"{_NS}::fused_topk_softmax_bwd", mutates_args=())
+def _fused_topk_softmax_bwd(grad_weights: torch.Tensor, weights: torch.Tensor,
+                            indices: torch.Tensor, num_tokens: int, E: int, K: int) -> torch.Tensor:
+    grad_logits = torch.zeros((num_tokens, E), device=weights.device, dtype=weights.dtype)
+
+    BLOCK_K = triton.next_power_of_2(K)
+
+    # Grid is determined dynamically by the autotuned BLOCK_M config
+    grid = lambda META: (triton.cdiv(num_tokens, META['BLOCK_M']),)
+
+    _fused_topk_softmax_bwd_kernel_2d[grid](
+        grad_weights, weights, indices, grad_logits,
+        num_tokens, E, K, BLOCK_K=BLOCK_K,
+    )
+
+    return grad_logits
+
+
+@_fused_topk_softmax_bwd.register_fake
+def _(grad_weights: torch.Tensor, weights: torch.Tensor,
+      indices: torch.Tensor, num_tokens: int, E: int, K: int):
+    return torch.empty((num_tokens, E), device=weights.device, dtype=weights.dtype)
+
+
 class FusedTopkSoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, K):
-        num_tokens, E = logits.shape
-        weights = torch.empty((num_tokens, K), device=logits.device, dtype=logits.dtype)
-        indices = torch.empty((num_tokens, K), device=logits.device, dtype=torch.int32)
-        
-        BLOCK_E = triton.next_power_of_2(E)
-        
-        # Grid is determined dynamically by the autotuned BLOCK_M config
-        grid = lambda META: (triton.cdiv(num_tokens, META['BLOCK_M']),)
-        
-        _fused_topk_softmax_fwd_kernel_2d[grid](
-            logits, weights, indices,
-            num_tokens, E, K, BLOCK_E=BLOCK_E,
-        )
-        
+        weights, indices = torch.ops.tg.fused_topk_softmax_fwd(logits, K)
         ctx.save_for_backward(weights, indices)
-        ctx.E = E
-        ctx.K = K
+        ctx.E = logits.shape[1]
         return weights, indices
 
     @staticmethod
     def backward(ctx, grad_weights, grad_indices):
         weights, indices = ctx.saved_tensors
         E = ctx.E
-        K = ctx.K
         num_tokens = weights.shape[0]
-        
-        grad_logits = torch.zeros((num_tokens, E), device=weights.device, dtype=weights.dtype)
-        
-        BLOCK_K = triton.next_power_of_2(K)
-        
-        # Grid is determined dynamically by the autotuned BLOCK_M config
-        grid = lambda META: (triton.cdiv(num_tokens, META['BLOCK_M']),)
-        
-        _fused_topk_softmax_bwd_kernel_2d[grid](
-            grad_weights, weights, indices, grad_logits,
-            num_tokens, E, K, BLOCK_K=BLOCK_K,
-        )
-        
+        K = weights.shape[1]
+        grad_logits = torch.ops.tg.fused_topk_softmax_bwd(
+            grad_weights, weights, indices, num_tokens, E, K)
         return grad_logits, None
 
 

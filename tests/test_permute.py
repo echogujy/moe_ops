@@ -4,7 +4,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
-from triton_gmm_ops.permute import permute, permute_backward, permute_countsort
+# permute_countsort lives in the permute submodule but isn't re-exported
+# at the package top level, so import it from there.
+from triton_gmm_ops.permute_ops import permute, permute_backward, permute_countsort
 
 
 # ---------------------------------------------------------------------------

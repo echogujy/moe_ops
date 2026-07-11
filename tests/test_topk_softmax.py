@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 import time
-from triton_gmm_ops.fused_topk_softmax import fused_topk_softmax
+from triton_gmm_ops import fused_topk_softmax
 
 DEVICE = "cuda"
 
