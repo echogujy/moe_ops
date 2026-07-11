@@ -82,12 +82,14 @@ def gmm_try_fn(A, B, offsets, trans_b: bool = True):
     total, K = A.shape
     E = B.shape[0]
     N = B.shape[1] if trans_b else B.shape[2]
-    # Size the M-grid by the largest expert, not by `total`. The old grid used
-    # `total` -> ~E x empty tiles early-returning (pure launch waste).
-    M_max = int((offsets[1:] - offsets[:-1]).max().item())
     C = torch.empty((total, N), device=A.device, dtype=dtype)
+    # M-grid sized by `total` (not the max expert size M_max). Computing M_max
+    # needs `.item()`, which forces a CPU sync + unbacked symbol under
+    # torch.compile -> graph break / compile crash. Oversizing the M-grid only
+    # launches a few extra tiles that early-return per expert (see kernel guard),
+    # so correctness is unchanged and the cost is negligible vs. a graph break.
     grid = lambda META: (
-        triton.cdiv(M_max, META['BLOCK_SIZE_M']),
+        triton.cdiv(total, META['BLOCK_SIZE_M']),
         triton.cdiv(N, META['BLOCK_SIZE_N']),
         E,
     )

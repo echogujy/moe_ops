@@ -20,7 +20,7 @@ def _bench(fn, warmup=10, iters=100):
     return (time.time() - start) * 1000 / iters
 
 
-def run_correctness(dtype=torch.bfloat16, atol=3.0, rtol=0.02):
+def run_correctness(dtype=torch.bfloat16, atol=1.5, rtol=0.02):
     # Shapes
     num_tokens = 8192
     K = 4096
@@ -55,28 +55,46 @@ def run_correctness(dtype=torch.bfloat16, atol=3.0, rtol=0.02):
     C_native.backward(grad_output, retain_graph=True)
     grad_A_nat = A_n.grad.clone()
     grad_B_nat = w_native_n.grad.transpose(1, 2).clone()
-    
-    # bf16 K=4096 GEMM: abs error <= ~2.0 (BF16 accumulation), rel ~0.5%.
-    # Use allclose-style: |a-b| <= atol + rtol * |b|.
-    ATOL, RTOL = atol, rtol
-    ok_fwd   = torch.allclose(C_tri.float(),      C_native.float(), atol=ATOL, rtol=RTOL)
-    ok_ga    = torch.allclose(grad_A_tri.float(),  grad_A_nat.float(), atol=ATOL, rtol=RTOL)
-    ok_gb    = torch.allclose(grad_B_tri.float(),  grad_B_nat.float(), atol=ATOL, rtol=RTOL)
-    abs_fwd  = (C_tri.float() - C_native.float()).abs().max().item()
-    abs_ga   = (grad_A_tri.float() - grad_A_nat.float()).abs().max().item()
-    abs_gb   = (grad_B_tri.float() - grad_B_nat.float()).abs().max().item()
 
-    print("================================================================")
-    print(f"Correctness Check - Triton vs Torch Native ({dtype}, K={K}):")
-    print("================================================================")
-    print(f"  Forward  abs_max: {abs_fwd:.3f}  -> {'PASS' if ok_fwd else 'FAIL'}")
-    print(f"  Grad_A   abs_max: {abs_ga:.3f}  -> {'PASS' if ok_ga else 'FAIL'}")
-    print(f"  Grad_B   abs_max: {abs_gb:.3f}  -> {'PASS' if ok_gb else 'FAIL'}")
-    print(f"  (atol={ATOL}, rtol={RTOL})")
-    print("================================================================")
-    assert ok_fwd, f"[{dtype}] grouped_gemm forward abs diff too large: {abs_fwd:.3f}"
-    assert ok_ga,  f"[{dtype}] grouped_gemm grad_A abs diff too large: {abs_ga:.3f}"
-    assert ok_gb,  f"[{dtype}] grouped_gemm grad_B abs diff too large: {abs_gb:.3f}"
+    # ── Float32 loop reference (ground truth) ────────────────────────────────
+    A_f32 = A.detach().float()
+    B_f32 = B.detach().float()
+    go_f32 = grad_output.float()
+
+    C_ref  = torch.zeros(num_tokens, N, device=DEVICE)
+    gA_ref = torch.zeros_like(A_f32)
+    gB_ref = torch.zeros(E, N, K, device=DEVICE)
+
+    for g in range(E):
+        s, e = offsets_tri[g].item(), offsets_tri[g + 1].item()
+        C_ref[s:e]  = A_f32[s:e] @ B_f32[g].t()
+        gA_ref[s:e] = go_f32[s:e] @ B_f32[g]
+        gB_ref[g]   = go_f32[s:e].t() @ A_f32[s:e]
+
+    def _check(x_tri, x_nat, ref):
+        d_tri = (x_tri.float() - ref).abs().max().item()
+        d_nat = (x_nat.float() - ref).abs().max().item()
+        tol   = atol + rtol * ref.abs().max().item()
+        return d_tri <= tol, d_nat <= tol, d_tri, d_nat
+
+    ok_fwd_t, ok_fwd_n, abs_fwd_t, abs_fwd_n = _check(C_tri,      C_native,   C_ref)
+    ok_ga_t,  ok_ga_n,  abs_ga_t,  abs_ga_n  = _check(grad_A_tri, grad_A_nat, gA_ref)
+    ok_gb_t,  ok_gb_n,  abs_gb_t,  abs_gb_n  = _check(grad_B_tri, grad_B_nat, gB_ref)
+
+    W = 72
+    print("=" * W)
+    print(f"Correctness vs float32 loop reference ({dtype}, K={K}):")
+    print(f"  (atol={atol}, rtol={rtol})")
+    print("=" * W)
+    print(f"{'':12s}  {'Triton abs_max':>16s}  {'Native abs_max':>16s}")
+    print(f"{'Forward':12s}  {abs_fwd_t:>14.4f}  {'✓' if ok_fwd_t else '✗'}  {abs_fwd_n:>14.4f}  {'✓' if ok_fwd_n else '✗'}")
+    print(f"{'Grad_A':12s}  {abs_ga_t:>14.4f}  {'✓' if ok_ga_t else '✗'}  {abs_ga_n:>14.4f}  {'✓' if ok_ga_n else '✗'}")
+    print(f"{'Grad_B':12s}  {abs_gb_t:>14.4f}  {'✓' if ok_gb_t else '✗'}  {abs_gb_n:>14.4f}  {'✓' if ok_gb_n else '✗'}")
+    print("=" * W)
+
+    assert ok_fwd_t, f"[{dtype}] Triton forward  abs diff too large vs f32 ref: {abs_fwd_t:.4f}"
+    assert ok_ga_t,  f"[{dtype}] Triton grad_A   abs diff too large vs f32 ref: {abs_ga_t:.4f}"
+    assert ok_gb_t,  f"[{dtype}] Triton grad_B   abs diff too large vs f32 ref: {abs_gb_t:.4f}"
 
 def run_benchmark():
     shapes = [
@@ -162,6 +180,6 @@ def run_benchmark():
 
 
 if __name__ == "__main__":
-    run_correctness(torch.bfloat16, atol=3.0, rtol=0.02)
-    run_correctness(torch.float32,   atol=0.5, rtol=0.01)
+    run_correctness(torch.bfloat16, atol=1.5, rtol=0.02)
+    run_correctness(torch.float32,  atol=0.3, rtol=0.01)
     run_benchmark()
