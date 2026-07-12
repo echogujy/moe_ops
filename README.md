@@ -8,10 +8,10 @@ All ops share the stacked MoE layout:
 
 | tensor      | shape                                           | meaning                                                                       |
 | ----------- | ----------------------------------------------- | ----------------------------------------------------------------------------- |
-| `A`         | `[total_tokens, K]`                             | activations, all experts stacked along M                                      |
-| `B`         | `[E, N, K]` if `trans_b` else `[E, K, N]`       | per-expert weights                                                            |
-| `offsets`   | `[E]`                                           | cumulative group ends (`offsets[e]` = end row of expert `e`; starts at 0)     |
-| `C`         | `[total_tokens, N]`                             | stacked output                                                                |
+| `A`       | `[total_tokens, K]`                           | activations, all experts stacked along M                                      |
+| `B`       | `[E, N, K]` if `trans_b` else `[E, K, N]` | per-expert weights                                                            |
+| `offsets` | `[E]`                                         | cumulative group ends (`offsets[e]` = end row of expert `e`; starts at 0) |
+| `C`       | `[total_tokens, N]`                           | stacked output                                                                |
 
 `bf16` and `fp16` are supported (bf16 is the MoE default).
 

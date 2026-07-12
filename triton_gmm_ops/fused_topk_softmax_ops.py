@@ -17,53 +17,54 @@ _NS = "tg"
 @triton.jit
 def _fused_topk_softmax_fwd_kernel_2d(
     logits_ptr, weights_ptr, indices_ptr,
-    num_tokens, E, K: tl.constexpr, 
-    BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr,
+    num_tokens, E, K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     tile_m_idx = tl.program_id(0).to(tl.int64)
-    
+
     # Row offsets
     offs_m = tile_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = offs_m < num_tokens
-    
-    # Column offsets
+
+    # Column offsets (E dimension)
     offs_e = tl.arange(0, BLOCK_E)
-    
+
     # 2D Load: shape [BLOCK_M, BLOCK_E]
     logits_ptrs = logits_ptr + offs_m[:, None] * E + offs_e[None, :]
     load_mask = m_mask[:, None] & (offs_e[None, :] < E)
     logits = tl.load(logits_ptrs, mask=load_mask, other=-float('inf'))
-    
-    # Registers to hold top-k values and indices, shape [BLOCK_M, K]
-    w = tl.zeros((BLOCK_M, K), dtype=tl.float32)
-    idxs = tl.zeros((BLOCK_M, K), dtype=tl.int32)
-    
+
+    # Top-k registers padded to a power-of-2 block dim: K itself (e.g. 6) is
+    # not always a power of 2, and Triton rejects non-pow2 block shapes.
+    # Padding columns hold -inf for weights so the axis-1 max/sum ignore them.
+    offs_k = tl.arange(0, BLOCK_K)
+    w = tl.full((BLOCK_M, BLOCK_K), -float('inf'), dtype=tl.float32)
+    idxs = tl.full((BLOCK_M, BLOCK_K), 0, dtype=tl.int32)
+
     temp_logits = logits
-    offs_k = tl.arange(0, K)
-    
+
     for k in range(K):
         # reduction along axis 1 (expert dimension)
         val = tl.max(temp_logits, axis=1) # [BLOCK_M]
         idx = tl.argmax(temp_logits, axis=1) # [BLOCK_M]
-        
-        # Broadcast indices and values to fill the k-th column
-        mask_k = offs_k[None, :] == k # [1, K]
+
         # Insert val and idx into the k-th column of w and idxs
+        mask_k = offs_k[None, :] == k # [1, BLOCK_K]
         w = tl.where(mask_k, val[:, None], w)
         idxs = tl.where(mask_k, idx[:, None].to(tl.int32), idxs)
-        
+
         # Mask out the maximum element for each row
-        # Compare each column index with the argmax index of that row
         mask_e = offs_e[None, :] == idx[:, None] # [BLOCK_M, BLOCK_E]
         temp_logits = tl.where(mask_e, -float('inf'), temp_logits)
-        
-    # Stable Softmax along axis 1 (K dimension)
+
+    # Stable Softmax along axis 1 (K dimension). Padding columns stay -inf
+    # so they contribute 0 to max/sum and drop out of the result.
     w_max = tl.max(w, axis=1)
     w_exp = tl.exp(w - w_max[:, None])
     w_sum = tl.sum(w_exp, axis=1)
     w_softmax = w_exp / w_sum[:, None]
-    
-    # 2D Store: shape [BLOCK_M, K]
+
+    # 2D Store: shape [BLOCK_M, K] (only real K columns written)
     store_mask = m_mask[:, None] & (offs_k[None, :] < K)
     tl.store(weights_ptr + offs_m[:, None] * K + offs_k[None, :], w_softmax.to(weights_ptr.dtype.element_ty), mask=store_mask)
     tl.store(indices_ptr + offs_m[:, None] * K + offs_k[None, :], idxs, mask=store_mask)
@@ -124,13 +125,14 @@ def _fused_topk_softmax_fwd(logits: torch.Tensor, K: int) -> tuple[torch.Tensor,
     indices = torch.empty((num_tokens, K), device=logits.device, dtype=torch.int32)
 
     BLOCK_E = triton.next_power_of_2(E)
+    BLOCK_K = triton.next_power_of_2(K)
 
     # Grid is determined dynamically by the autotuned BLOCK_M config
     grid = lambda META: (triton.cdiv(num_tokens, META['BLOCK_M']),)
 
     _fused_topk_softmax_fwd_kernel_2d[grid](
         logits, weights, indices,
-        num_tokens, E, K, BLOCK_E=BLOCK_E,
+        num_tokens, E, K, BLOCK_E=BLOCK_E, BLOCK_K=BLOCK_K,
     )
 
     return weights, indices

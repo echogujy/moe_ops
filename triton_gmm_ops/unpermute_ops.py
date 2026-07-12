@@ -100,7 +100,7 @@ def _unpermute_bwd_kernel(
     stride_ag_r, stride_ag_c,
     stride_prob_r, stride_prob_c,
     stride_pg_r, stride_pg_c,
-    BLOCK_C: tl.constexpr,
+    BLOCK_C: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     # Grid: one program per token t (NOT per (t,k)). Each program owns token t and
     # loops over its topK slots internally. This lets grad_out[t] be loaded ONCE
@@ -116,10 +116,13 @@ def _unpermute_bwd_kernel(
     # so each act_grad row i is written by exactly one program (the one owning t
     # and that specific k), and each prob_grad[t,k] by its own program.
     t = tl.program_id(0)
-    kidx = tl.arange(0, topK)
+    kidx = tl.arange(0, BLOCK_K)
 
-    # per-k prob_grad accumulator: a [topK] vector reduced across all column blocks.
-    acc = tl.zeros([topK], dtype=tl.float32)
+    # per-k prob_grad accumulator: a [BLOCK_K] vector padded to a power of
+    # 2 (topK itself may be e.g. 6), reduced across all column blocks.
+    # Only the first `topK` columns are real; padding stays 0 and is
+    # dropped by the store mask below.
+    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
     for c0 in range(0, tl.cdiv(num_cols, BLOCK_C)):
         cols = c0 * BLOCK_C + tl.arange(0, BLOCK_C)
         mask = cols < num_cols
@@ -141,9 +144,10 @@ def _unpermute_bwd_kernel(
             # Cast back to the activation dtype (e.g. bf16) on store.
             tl.store(act_grad_ptr + i * stride_ag_r + cols * stride_ag_c,
                      (g * p).to(act_grad_ptr.dtype.element_ty), mask=mask)
-    # prob_grad[t, :] = acc.
+    # prob_grad[t, :] = acc.  Only the real `topK` columns are written;
+    # the padded columns (kidx >= topK) are dropped via the store mask.
     tl.store(prob_grad_ptr + t * stride_pg_r + kidx * stride_pg_c,
-             acc.to(prob_grad_ptr.dtype.element_ty))
+             acc.to(prob_grad_ptr.dtype.element_ty), mask=kidx < topK)
 
 
 @torch.library.custom_op(f"{_NS}::unpermute_backward", mutates_args=())
@@ -154,6 +158,7 @@ def unpermute_backward(grad_out: torch.Tensor, input_fwd: torch.Tensor,
     num_cols = input_fwd.shape[1]
     act_grad = torch.empty_like(input_fwd)  # [num_out, num_cols]
     prob_grad = torch.empty(num_tokens, num_topK, device=prob.device, dtype=torch.float32)
+    BLOCK_K = triton.next_power_of_2(num_topK)
     _unpermute_bwd_kernel[(num_tokens,)](
         grad_out, input_fwd, row_id_map, prob, act_grad, prob_grad,
         num_tokens, num_cols, num_topK,
@@ -162,6 +167,7 @@ def unpermute_backward(grad_out: torch.Tensor, input_fwd: torch.Tensor,
         act_grad.stride(0), act_grad.stride(1),
         prob.stride(0), prob.stride(1),
         prob_grad.stride(0), prob_grad.stride(1),
+        BLOCK_K=BLOCK_K,
     )
     return act_grad, prob_grad
 

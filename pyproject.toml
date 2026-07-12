@@ -13,9 +13,14 @@ dependencies = [
     "triton",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["triton_gmm_ops*"]
+# The project dir is also named `triton_gmm_ops`, which makes setuptools
+# collapse the package path onto the repo root (a namespace package with no
+# __init__.py), breaking `from triton_gmm_ops import ...`. Map the package
+# name to its real directory explicitly so a normal (non-editable) install
+# copies the inner package into site-packages correctly.
+[tool.setuptools]
+package-dir = {"triton_gmm_ops" = "triton_gmm_ops"}
+packages = ["triton_gmm_ops"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
