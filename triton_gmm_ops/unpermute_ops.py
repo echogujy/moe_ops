@@ -157,7 +157,7 @@ def unpermute_backward(grad_out: torch.Tensor, input_fwd: torch.Tensor,
     """Backward: single merged kernel computing both act_grad and prob_grad."""
     num_cols = input_fwd.shape[1]
     act_grad = torch.empty_like(input_fwd)  # [num_out, num_cols]
-    prob_grad = torch.empty(num_tokens, num_topK, device=prob.device, dtype=torch.float32)
+    prob_grad = torch.empty(num_tokens, num_topK, device=prob.device, dtype=prob.dtype)
     BLOCK_K = triton.next_power_of_2(num_topK)
     _unpermute_bwd_kernel[(num_tokens,)](
         grad_out, input_fwd, row_id_map, prob, act_grad, prob_grad,
@@ -175,7 +175,7 @@ def unpermute_backward(grad_out: torch.Tensor, input_fwd: torch.Tensor,
 @unpermute_backward.register_fake
 def _(grad_out, input_fwd, row_id_map, prob, num_tokens, num_topK):
     act_grad = torch.empty_like(input_fwd)
-    prob_grad = torch.empty(num_tokens, num_topK, device=prob.device, dtype=torch.float32)
+    prob_grad = torch.empty(num_tokens, num_topK, device=prob.device, dtype=prob.dtype)
     return act_grad, prob_grad
 
 

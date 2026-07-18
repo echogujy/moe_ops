@@ -190,15 +190,18 @@ class FusedTopkSoftmaxFunction(torch.autograd.Function):
         return grad_logits, None
 
 
-def fused_topk_softmax(logits: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+def fused_topk_softmax(logits: torch.Tensor, K: int, fp32_routing: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Top-K Softmax operator.
     
     Args:
         logits (Tensor): Input logits of shape [num_tokens, num_experts].
         K (int): Top-K value.
+        fp32_routing (bool): If True, forces routing weights calculation to be done in float32.
         
     Returns:
         weights (Tensor): Softmax weights of shape [num_tokens, K].
         indices (Tensor): Selected expert indices of shape [num_tokens, K].
     """
+    if fp32_routing and logits.dtype != torch.float32:
+        logits = logits.float()
     return FusedTopkSoftmaxFunction.apply(logits, K)

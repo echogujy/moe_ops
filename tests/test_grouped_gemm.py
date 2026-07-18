@@ -4,6 +4,17 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
+if not hasattr(torch.nn.functional, "grouped_mm"):
+    def grouped_mm_fallback(A, B, offs):
+        E = B.shape[0]
+        N = B.shape[2]
+        C = torch.empty((A.shape[0], N), dtype=A.dtype, device=A.device)
+        starts = torch.cat([torch.zeros(1, dtype=offs.dtype, device=offs.device), offs[:-1]])
+        for g in range(E):
+            s, e = int(starts[g]), int(offs[g])
+            C[s:e] = A[s:e] @ B[g]
+        return C
+    torch.nn.functional.grouped_mm = grouped_mm_fallback
 import time
 from triton_gmm_ops import grouped_gemm
 

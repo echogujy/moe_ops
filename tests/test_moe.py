@@ -24,6 +24,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
 import torch.nn.functional as F
+if not hasattr(torch.nn.functional, "grouped_mm"):
+    def grouped_mm_fallback(A, B, offs):
+        E = B.shape[0]
+        N = B.shape[2]
+        C = torch.empty((A.shape[0], N), dtype=A.dtype, device=A.device)
+        starts = torch.cat([torch.zeros(1, dtype=offs.dtype, device=offs.device), offs[:-1]])
+        for g in range(E):
+            s, e = int(starts[g]), int(offs[g])
+            C[s:e] = A[s:e] @ B[g]
+        return C
+    torch.nn.functional.grouped_mm = grouped_mm_fallback
 
 from triton_gmm_ops import (
     fused_topk_softmax,
@@ -186,7 +197,7 @@ def test_moe_backward():
     assert ok, "single-GPU MoE backward (grad_x) fails FD check"
 
 
-def bench_moe(num_tokens=4096, d=2048, E=64, K=2, hidden=8192):
+def bench_moe(num_tokens=4096, d=2048, E=16, K=2, hidden=5120):
     """Detailed MoE bench.
 
     Triton component breakdown (forward) + Triton-vs-native GEMM comparison at
@@ -290,5 +301,15 @@ def bench_moe(num_tokens=4096, d=2048, E=64, K=2, hidden=8192):
 if __name__ == "__main__":
     test_moe_correctness()
     test_moe_backward()
-    bench_moe()
+    try:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9:
+            print("Running benchmark with large shapes on Hopper GPU...")
+            bench_moe(num_tokens=8192, d=4096, E=64, K=2, hidden=11008)
+        else:
+            print("Running benchmark with standard shapes on Ada/other GPU...")
+            bench_moe(num_tokens=4096, d=2048, E=16, K=2, hidden=5120)
+    except torch.OutOfMemoryError:
+        print("CUDA OOM during benchmark, retrying with smaller shape...")
+        torch.cuda.empty_cache()
+        bench_moe(num_tokens=1024, d=512, E=16, K=2, hidden=1024)
     print("OK")

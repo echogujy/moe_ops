@@ -31,13 +31,14 @@ Layout conventions (see each module's docstring for details)
 
 bf16 and fp16 are supported; bf16 is the MoE default.
 """
-from .grouped_gemm_ops import grouped_gemm
+from .grouped_gemm_ops_sm90 import grouped_gemm, supports_tma
 from .permute_ops import permute, permute_backward
 from .unpermute_ops import unpermute, unpermute_forward, unpermute_backward
 from .fused_topk_softmax_ops import fused_topk_softmax
 
 __all__ = [
     "grouped_gemm",
+    "supports_tma",
     "permute",
     "permute_backward",
     "unpermute",
